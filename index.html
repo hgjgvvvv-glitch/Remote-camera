@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remote Camera Capture</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#172033;background:#f3f5f9}
+*{box-sizing:border-box}body{margin:0;padding:24px 14px}
+main{max-width:760px;margin:auto}.card{background:#fff;border:1px solid #e1e6ef;border-radius:18px;padding:20px;margin:14px 0;box-shadow:0 5px 20px #15213a0a}
+h1{font-size:1.55rem;margin:0 0 8px}h2{font-size:1.12rem;margin:0 0 12px}
+p{line-height:1.5;color:#536078}.muted{font-size:.9rem;color:#68758b}
+button,input{font:inherit;border-radius:11px;padding:12px 14px}
+button{border:0;background:#2459d3;color:#fff;font-weight:650;cursor:pointer}
+button.secondary{background:#e9eef8;color:#1d3157}button.danger{background:#b42318}
+button:disabled{opacity:.45;cursor:not-allowed}
+input{width:100%;border:1px solid #cbd3e1;margin:8px 0 12px}
+nav{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+nav a{padding:10px 13px;background:#e7ecf5;border-radius:10px;color:#24385c;text-decoration:none;font-weight:600}
+nav a.active{background:#2459d3;color:white}
+video,img{width:100%;max-height:440px;object-fit:contain;background:#111;border-radius:12px}
+.status{padding:10px 12px;background:#f0f4fb;border-radius:10px;margin:12px 0;color:#344665}
+label.consent{display:flex;gap:10px;align-items:flex-start;margin:14px 0;color:#26344d}
+label.consent input{width:auto;margin:4px 0 0}
+.hidden{display:none}.row{display:flex;gap:10px;flex-wrap:wrap}.row button{flex:1}
+code{overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>Remote Camera Capture</h1>
+    <p>Use your phone as a camera and let a trusted person request a photo while you can see the live preview.</p>
+    <nav>
+      <a id="cameraTab" href="#camera">Phone camera</a>
+      <a id="controllerTab" href="#controller">Remote controller</a>
+    </nav>
+    <p class="muted">Both devices need an internet connection. Use this site only with people you trust.</p>
+  </div>
+
+  <section id="cameraView" class="card hidden">
+    <h2>Phone camera</h2>
+    <p>Choose Start camera, review the consent below, and keep this page open. Your browser will ask for camera permission.</p>
+    <label class="consent"><input id="remoteConsent" type="checkbox">
+      <span><strong>I agree to remote photo requests.</strong> While this session is active, the connected controller may request a photo. The live preview stays visible on this phone, and I can stop the session at any time.</span>
+    </label>
+    <div class="row">
+      <button id="startCamera">Start camera session</button>
+      <button id="stopCamera" class="danger" disabled>Stop camera</button>
+    </div>
+    <div id="cameraStatus" class="status" role="status">Camera is off.</div>
+    <video id="preview" autoplay playsinline muted></video>
+    <div id="shareBox" class="hidden">
+      <p><strong>Share this camera session ID with your trusted friend:</strong></p>
+      <input id="myId" readonly>
+      <button id="copyId" class="secondary">Copy session ID</button>
+      <p class="muted">Do not post this ID publicly. Anyone who obtains it may be able to request a photo during this active session.</p>
+    </div>
+  </section>
+
+  <section id="controllerView" class="card hidden">
+    <h2>Remote controller</h2>
+    <p>Ask the phone owner to start their camera session and share the session ID with you.</p>
+    <label for="remoteId"><strong>Phone camera session ID</strong></label>
+    <input id="remoteId" placeholder="Paste the session ID here" autocomplete="off">
+    <div class="row">
+      <button id="connect">Connect</button>
+      <button id="disconnect" class="secondary" disabled>Disconnect</button>
+    </div>
+    <div id="controllerStatus" class="status" role="status">Not connected.</div>
+    <button id="takePhoto" disabled>Request a photo</button>
+    <p class="muted">A photo is returned only after the phone owner has enabled remote capture and connected this controller.</p>
+    <div id="resultBox" class="hidden">
+      <h2>Received photo</h2>
+      <img id="resultImage" alt="Photo received from the phone camera">
+      <p><a id="downloadPhoto" download="remote-camera-photo.jpg">Download photo</a></p>
+    </div>
+  </section>
+
+  <div class="card">
+    <h2>Privacy controls</h2>
+    <p>Stop the camera session to end access. You can also revoke camera permission in your browser settings. This demo sends photos directly over a peer-to-peer data connection; it does not intentionally store them on a website server.</p>
+    <p class="muted">The connection uses PeerJS's public signaling service by default. Do not use this demo for sensitive images or confidential situations.</p>
+  </div>
+</main>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const mode = location.hash.toLowerCase() === "#controller" ? "controller" : "camera";
+  $("cameraView").classList.toggle("hidden", mode !== "camera");
+  $("controllerView").classList.toggle("hidden", mode !== "controller");
+  $("cameraTab").classList.toggle("active", mode === "camera");
+  $("controllerTab").classList.toggle("active", mode === "controller");
+
+  let peer = null, stream = null, incomingConn = null, outgoingConn = null;
+  const setCameraStatus = t => $("cameraStatus").textContent = t;
+  const setControllerStatus = t => $("controllerStatus").textContent = t;
+
+  if (!window.Peer) {
+    setCameraStatus("Could not load the connection library. Check your internet connection and reload.");
+    setControllerStatus("Could not load the connection library. Check your internet connection and reload.");
+    return;
+  }
+
+  function newPeer() {
+    return new Peer(undefined, {debug: 1});
+  }
+
+  // PHONE / CAMERA SIDE
+  $("startCamera").addEventListener("click", async () => {
+    if (!$("remoteConsent").checked) {
+      setCameraStatus("Please tick the remote-photo consent box before starting.");
+      return;
+    }
+    $("startCamera").disabled = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode: {ideal: "user"}, width: {ideal: 1280}, height: {ideal: 720}},
+        audio: false
+      });
+      $("preview").srcObject = stream;
+      peer = newPeer();
+      peer.on("open", id => {
+        $("myId").value = id;
+        $("shareBox").classList.remove("hidden");
+        $("stopCamera").disabled = false;
+        setCameraStatus("Camera is live. Waiting for your trusted controller to connect.");
+      });
+      peer.on("connection", conn => {
+        if (incomingConn && incomingConn.open) { conn.close(); return; }
+        incomingConn = conn;
+        conn.on("open", () => setCameraStatus("Controller connected. Your camera preview is active."));
+        conn.on("data", async message => {
+          if (!message || message.type !== "CAPTURE_REQUEST") return;
+          if (!stream || !stream.active) return;
+          try {
+            const video = $("preview");
+            if (!video.videoWidth) throw new Error("Camera is not ready yet.");
+            const canvas = document.createElement("canvas");
+            const scale = Math.min(1, 1600 / video.videoWidth);
+            canvas.width = Math.round(video.videoWidth * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
+            canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+            conn.send({type: "PHOTO", dataUrl, capturedAt: new Date().toISOString()});
+            setCameraStatus("Photo sent to the connected controller. Camera remains active until you stop it.");
+          } catch (err) {
+            conn.send({type: "ERROR", message: err.message || "Could not capture photo."});
+          }
+        });
+        conn.on("close", () => {
+          incomingConn = null;
+          setCameraStatus("Controller disconnected. Camera is still active; stop it when finished.");
+        });
+        conn.on("error", () => setCameraStatus("Connection error. You can stop and restart the session."));
+      });
+      peer.on("error", err => setCameraStatus("Connection error: " + err.type));
+    } catch (err) {
+      $("startCamera").disabled = false;
+      setCameraStatus("Could not start camera: " + (err.message || err));
+    }
+  });
+
+  $("stopCamera").addEventListener("click", () => {
+    if (incomingConn) incomingConn.close();
+    if (peer) { peer.destroy(); peer = null; }
+    if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
+    $("preview").srcObject = null;
+    $("myId").value = "";
+    $("shareBox").classList.add("hidden");
+    $("stopCamera").disabled = true;
+    $("startCamera").disabled = false;
+    $("remoteConsent").checked = false;
+    setCameraStatus("Camera session stopped. Camera and connection are off.");
+  });
+
+  $("copyId").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText($("myId").value); $("copyId").textContent = "Copied"; }
+    catch { $("myId").select(); document.execCommand("copy"); $("copyId").textContent = "Copied"; }
+  });
+
+  // CONTROLLER SIDE
+  $("connect").addEventListener("click", () => {
+    const id = $("remoteId").value.trim();
+    if (!id) { setControllerStatus("Enter the session ID first."); return; }
+    if (peer) peer.destroy();
+    peer = newPeer();
+    $("connect").disabled = true;
+    peer.on("open", () => {
+      outgoingConn = peer.connect(id, {reliable: true});
+      outgoingConn.on("open", () => {
+        setControllerStatus("Connected. The phone owner has an active camera session.");
+        $("takePhoto").disabled = false;
+        $("disconnect").disabled = false;
+      });
+      outgoingConn.on("data", message => {
+        if (message.type === "PHOTO") {
+          $("resultImage").src = message.dataUrl;
+          $("downloadPhoto").href = message.dataUrl;
+          $("resultBox").classList.remove("hidden");
+          setControllerStatus("Photo received.");
+        } else if (message.type === "ERROR") {
+          setControllerStatus("Camera error: " + message.message);
+        }
+      });
+      outgoingConn.on("close", () => {
+        setControllerStatus("Connection closed.");
+        $("takePhoto").disabled = true;
+        $("disconnect").disabled = true;
+        $("connect").disabled = false;
+      });
+      outgoingConn.on("error", () => {
+        setControllerStatus("Connection error. Check the ID and try again.");
+        $("connect").disabled = false;
+      });
+    });
+    peer.on("error", err => {
+      setControllerStatus("Could not connect: " + err.type + ". Check the session ID and try again.");
+      $("connect").disabled = false;
+    });
+  });
+
+  $("takePhoto").addEventListener("click", () => {
+    if (outgoingConn && outgoingConn.open) {
+      outgoingConn.send({type: "CAPTURE_REQUEST"});
+      setControllerStatus("Photo requested. Waiting for the phone...");
+    }
+  });
+
+  $("disconnect").addEventListener("click", () => {
+    if (outgoingConn) outgoingConn.close();
+    if (peer) { peer.destroy(); peer = null; }
+    outgoingConn = null;
+    $("takePhoto").disabled = true;
+    $("disconnect").disabled = true;
+    $("connect").disabled = false;
+    setControllerStatus("Disconnected.");
+  });
+
+  window.addEventListener("beforeunload", () => {
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (peer) peer.destroy();
+  });
+})();
+</script>
+</body>
+</html>
